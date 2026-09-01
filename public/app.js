@@ -1,0 +1,522 @@
+(() => {
+  const $ = (sel) => document.querySelector(sel);
+  const $all = (sel) => Array.from(document.querySelectorAll(sel));
+
+  // ---------- state ----------
+  let token = localStorage.getItem('geoping_token') || null;
+  let me = JSON.parse(localStorage.getItem('geoping_me') || 'null');
+  let socket = null;
+  let currentCircle = null;
+  let map = null;
+  let markers = new Map(); // userId -> L.Marker
+  let dropMarkers = new Map(); // dropId -> L.Marker
+  let watchId = null;
+  let lastSentAt = 0;
+  let lastSentPos = null;
+
+  // ---------- fetch helper ----------
+  async function api(path, opts = {}) {
+    const headers = Object.assign({}, opts.headers || {});
+    if (!(opts.body instanceof FormData)) headers['Content-Type'] = 'application/json';
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+    const res = await fetch(path, Object.assign({}, opts, { headers }));
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Something went wrong');
+    return data;
+  }
+
+  function showScreen(id) {
+    $all('.screen').forEach((s) => s.classList.add('hidden'));
+    $(id).classList.remove('hidden');
+  }
+
+  function toast(message, iconKey) {
+    const el = document.createElement('div');
+    el.className = 'toast';
+    el.innerHTML = (iconKey && ICONS[iconKey] ? `<span class="icon">${ICONS[iconKey]}</span>` : '') + `<span>${escapeHtml(message)}</span>`;
+    $('#toast-container').appendChild(el);
+    setTimeout(() => el.remove(), 5000);
+  }
+
+  function notify(title, body) {
+    toast(`${title}: ${body}`);
+    if (navigator.vibrate) navigator.vibrate([80, 40, 80]);
+    if ('Notification' in window && Notification.permission === 'granted') {
+      new Notification(title, { body, icon: '/icons/icon-192.png' });
+    }
+    playPingSound();
+  }
+
+  function playPingSound() {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.connect(g); g.connect(ctx.destination);
+      o.frequency.value = 880;
+      g.gain.setValueAtTime(0.15, ctx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
+      o.start(); o.stop(ctx.currentTime + 0.4);
+    } catch (e) { /* audio not available, ignore */ }
+  }
+
+  // A brief expanding-ring pulse — a nod to the app's name — used in place of
+  // anything more novelty (confetti, etc.) for a cleaner, more grown-up feel.
+  function successRipple(variant) {
+    const layer = $('#ripple-layer');
+    if (!layer) return;
+    [0, 140].forEach((delay) => {
+      setTimeout(() => {
+        const ring = document.createElement('span');
+        ring.className = 'ripple-ring' + (variant === 'accent' ? ' accent' : '');
+        layer.appendChild(ring);
+        setTimeout(() => ring.remove(), 950);
+      }, delay);
+    });
+  }
+
+  const ICONS = {
+    bell: '<svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M15 8a5 5 0 0 0-10 0c0 5-2 6-2 6h14s-2-1-2-6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M8.5 16.5a1.5 1.5 0 0 0 3 0" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>',
+    camera: '<svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 7.5a1.5 1.5 0 0 1 1.5-1.5h1.2l.9-1.4A1.5 1.5 0 0 1 7.87 4h4.26a1.5 1.5 0 0 1 1.27.7l.9 1.3h1.2A1.5 1.5 0 0 1 17 7.5v6A1.5 1.5 0 0 1 15.5 15h-11A1.5 1.5 0 0 1 3 13.5v-6z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><circle cx="10" cy="10.2" r="2.4" stroke="currentColor" stroke-width="1.4"/></svg>',
+    compass: '<svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="10" cy="10" r="7.5" stroke="currentColor" stroke-width="1.5"/><path d="m12.5 7.5-1.8 4.3-4.2 1.7 1.8-4.3 4.2-1.7z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>',
+    image: '<svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="3" y="4" width="14" height="12" rx="1.6" stroke="currentColor" stroke-width="1.5"/><circle cx="7.2" cy="8" r="1.1" stroke="currentColor" stroke-width="1.3"/><path d="m4 14 4-4 3 3 2.5-2.5L17 14" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>',
+  };
+
+  // ---------- auth ----------
+
+  $all('.tab-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      $all('.tab-btn').forEach((b) => b.classList.remove('active'));
+      btn.classList.add('active');
+      const tab = btn.dataset.tab;
+      $('#login-form').classList.toggle('hidden', tab !== 'login');
+      $('#register-form').classList.toggle('hidden', tab !== 'register');
+    });
+  });
+
+  $('#login-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    $('#login-error').textContent = '';
+    try {
+      const data = await api('/api/login', {
+        method: 'POST',
+        body: JSON.stringify({ username: fd.get('username'), password: fd.get('password') }),
+      });
+      onAuthed(data);
+    } catch (err) {
+      $('#login-error').textContent = err.message;
+    }
+  });
+
+  $('#register-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    $('#register-error').textContent = '';
+    try {
+      const data = await api('/api/register', {
+        method: 'POST',
+        body: JSON.stringify({ username: fd.get('username'), password: fd.get('password') }),
+      });
+      onAuthed(data);
+    } catch (err) {
+      $('#register-error').textContent = err.message;
+    }
+  });
+
+  function onAuthed(data) {
+    token = data.token;
+    me = data.user;
+    localStorage.setItem('geoping_token', token);
+    localStorage.setItem('geoping_me', JSON.stringify(me));
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+    connectSocket();
+    loadCircles();
+  }
+
+  $('#logout-btn').addEventListener('click', () => {
+    localStorage.removeItem('geoping_token');
+    localStorage.removeItem('geoping_me');
+    token = null; me = null;
+    if (socket) socket.disconnect();
+    stopWatchingPosition();
+    location.reload();
+  });
+
+  // ---------- socket ----------
+
+  function connectSocket() {
+    socket = io({ auth: { token } });
+
+    socket.on('ping:receive', ({ fromUsername, message }) => {
+      notify(`Alert from ${fromUsername}`, message || 'sent you an alert.');
+    });
+
+    socket.on('location:update', (loc) => {
+      if (currentCircle && loc.circleId === currentCircle.id) {
+        upsertMemberMarker(loc.userId, loc);
+        updateMemberLastSeen(loc.userId, loc.updatedAt);
+      }
+    });
+
+    socket.on('sharing:status', ({ userId, sharing }) => {
+      if (!currentCircle) return;
+      const chip = document.getElementById(`chip-${userId}`);
+      if (chip) chip.classList.toggle('offline', !sharing);
+    });
+
+    socket.on('drop:new', (drop) => {
+      if (currentCircle && drop.circleId === currentCircle.id) {
+        if (!drop.targetUserId || drop.targetUserId === me.id || drop.authorId === me.id) {
+          addDropToFeed(drop, true);
+          addDropMarker(drop);
+          if (drop.authorId !== me.id) toast(`${drop.authorName} added a photo`, 'image');
+        }
+      }
+    });
+
+    socket.on('circle:member-joined', () => { if (currentCircle) openCircle(currentCircle.id); });
+    socket.on('circle:member-left', () => { if (currentCircle) openCircle(currentCircle.id); });
+  }
+
+  // ---------- circles list ----------
+
+  async function loadCircles() {
+    showScreen('#circles-screen');
+    const { circles } = await api('/api/circles');
+    const list = $('#circles-list');
+    list.innerHTML = '';
+    if (circles.length === 0) {
+      list.innerHTML = `<div class="empty-state"><span class="icon">${ICONS.compass}</span>No circles yet. Create one below, or ask a friend for their invite code.</div>`;
+    }
+    circles.forEach((c) => {
+      const div = document.createElement('div');
+      div.className = 'circle-card';
+      const initial = (c.name || '?').trim().charAt(0).toUpperCase() || '?';
+      div.innerHTML = `
+        <div class="card-left">
+          <span class="circle-badge" style="background:${colorForUser(c.id)}">${initial}</span>
+          <div>
+            <div class="card-title">${escapeHtml(c.name)}</div>
+            <div class="meta">${c.members.length} member${c.members.length === 1 ? '' : 's'}</div>
+          </div>
+        </div>
+        <span class="arrow">&rarr;</span>`;
+      div.addEventListener('click', () => openCircle(c.id));
+      list.appendChild(div);
+    });
+  }
+
+  $('#create-circle-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    $('#circles-error').textContent = '';
+    const fd = new FormData(e.target);
+    try {
+      const { circle } = await api('/api/circles', { method: 'POST', body: JSON.stringify({ name: fd.get('name') }) });
+      e.target.reset();
+      successRipple();
+      toast(`${circle.name} is ready`);
+      await loadCircles();
+      openCircle(circle.id);
+    } catch (err) { $('#circles-error').textContent = err.message; }
+  });
+
+  $('#join-circle-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    $('#circles-error').textContent = '';
+    const fd = new FormData(e.target);
+    try {
+      const { circle } = await api('/api/circles/join', { method: 'POST', body: JSON.stringify({ code: fd.get('code') }) });
+      e.target.reset();
+      successRipple();
+      toast(`You joined ${circle.name}`);
+      await loadCircles();
+      openCircle(circle.id);
+    } catch (err) { $('#circles-error').textContent = err.message; }
+  });
+
+  $('#back-btn').addEventListener('click', () => {
+    stopWatchingPosition();
+    currentCircle = null;
+    loadCircles();
+  });
+
+  // ---------- circle / map ----------
+
+  async function openCircle(circleId) {
+    const { circles } = await api('/api/circles');
+    const circle = circles.find((c) => c.id === circleId);
+    if (!circle) return;
+    currentCircle = circle;
+    $('#circle-name').textContent = circle.name;
+    showScreen('#circle-screen');
+
+    initMap();
+    renderMembers(circle.members);
+    circle.members.forEach((m) => { if (m.location) upsertMemberMarker(m.id, m.location); });
+
+    await loadDrops(circle.id);
+    startWatchingPosition();
+    updateDropTargetOptions(circle.members);
+  }
+
+  function initMap() {
+    if (map) { map.remove(); map = null; markers.clear(); dropMarkers.clear(); }
+    map = L.map('map', { zoomControl: true }).setView([20, 0], 3);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors',
+      maxZoom: 19,
+    }).addTo(map);
+  }
+
+  function colorForUser(userId) {
+    let hash = 0;
+    for (const ch of userId) hash = (hash * 31 + ch.charCodeAt(0)) % 360;
+    return `hsl(${hash}, 62%, 42%)`;
+  }
+
+  function upsertMemberMarker(userId, loc) {
+    const member = currentCircle.members.find((m) => m.id === userId);
+    const label = member ? member.username : (userId === me.id ? me.username : 'Someone');
+    const isMe = userId === me.id;
+    const color = isMe ? '#00b6a0' : colorForUser(userId);
+    const initial = (label || '?').trim().charAt(0).toUpperCase() || '?';
+
+    const html = isMe
+      ? `<div class="me-pulse-wrap"><div class="me-pulse-ring"></div><div class="avatar-marker" style="background:${color}">${initial}</div></div>`
+      : `<div class="avatar-marker" style="background:${color}">${initial}</div>`;
+
+    const icon = L.divIcon({
+      className: '',
+      html,
+      iconSize: [28, 28],
+      iconAnchor: [14, 14],
+    });
+
+    if (markers.has(userId)) {
+      markers.get(userId).setLatLng([loc.lat, loc.lng]);
+    } else {
+      const marker = L.marker([loc.lat, loc.lng], { icon }).addTo(map);
+      marker.bindPopup(`<strong>${escapeHtml(label)}${isMe ? ' (you)' : ''}</strong>`);
+      markers.set(userId, marker);
+    }
+    if (isMe && !map._hasCentered) {
+      map.setView([loc.lat, loc.lng], 15);
+      map._hasCentered = true;
+    }
+  }
+
+  function renderMembers(members) {
+    const list = $('#members-list');
+    list.innerHTML = '';
+    members.forEach((m) => {
+      const chip = document.createElement('div');
+      chip.className = 'member-chip' + (m.sharing ? '' : ' offline');
+      chip.id = `chip-${m.id}`;
+      const isMe = m.id === me.id;
+      const initial = (m.username || '?').trim().charAt(0).toUpperCase() || '?';
+      const color = isMe ? '#00b6a0' : colorForUser(m.id);
+      chip.innerHTML = `
+        <span class="avatar-dot" style="background:${color}">${initial}</span>
+        <span class="name">${escapeHtml(m.username)}${isMe ? ' (you)' : ''}</span>
+        ${isMe ? '' : `<button class="ping-btn" data-user="${m.id}" title="Send an alert"><span class="icon">${ICONS.bell}</span></button>`}
+      `;
+      list.appendChild(chip);
+    });
+
+    $all('.ping-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        socket.emit('ping:send', {
+          targetUserId: btn.dataset.user,
+          circleId: currentCircle.id,
+          message: `${me.username} sent you an alert`,
+        });
+        toast('Alert sent', 'bell');
+      });
+    });
+  }
+
+  function updateMemberLastSeen(userId, updatedAt) {
+    const chip = document.getElementById(`chip-${userId}`);
+    if (!chip) return;
+    const el = chip.querySelector('.last-seen');
+    if (el) el.textContent = 'now';
+  }
+
+  function updateDropTargetOptions(members) {
+    const select = document.querySelector('select[name="targetUserId"]');
+    select.innerHTML = '<option value="">Everyone in this circle</option>';
+    members.filter((m) => m.id !== me.id).forEach((m) => {
+      const opt = document.createElement('option');
+      opt.value = m.id;
+      opt.textContent = `Just ${m.username}`;
+      select.appendChild(opt);
+    });
+  }
+
+  // ---------- geolocation ----------
+
+  function startWatchingPosition() {
+    if (!('geolocation' in navigator)) {
+      toast('This browser does not support location sharing.');
+      return;
+    }
+    stopWatchingPosition();
+    watchId = navigator.geolocation.watchPosition(onPosition, onPositionError, {
+      enableHighAccuracy: true,
+      maximumAge: 2000,
+      timeout: 15000,
+    });
+  }
+
+  function stopWatchingPosition() {
+    if (watchId !== null) {
+      navigator.geolocation.clearWatch(watchId);
+      watchId = null;
+    }
+  }
+
+  function onPosition(pos) {
+    const { latitude, longitude, accuracy, heading, speed } = pos.coords;
+    lastSentPos = { lat: latitude, lng: longitude };
+
+    if (currentCircle) upsertMemberMarker(me.id, { lat: latitude, lng: longitude });
+
+    const now = Date.now();
+    if (now - lastSentAt < 3000) return; // throttle to ~1 update/3s
+    lastSentAt = now;
+
+    if (socket && socket.connected) {
+      socket.emit('location:update', { lat: latitude, lng: longitude, accuracy, heading, speed });
+    }
+  }
+
+  function onPositionError(err) {
+    toast(`Location error: ${err.message}. Make sure location access is allowed for this site.`);
+  }
+
+  $('#sharing-checkbox').addEventListener('change', (e) => {
+    const enabled = e.target.checked;
+    if (socket) socket.emit('sharing:toggle', { enabled });
+    if (enabled) startWatchingPosition(); else stopWatchingPosition();
+  });
+
+  // ---------- drops (photos) ----------
+
+  async function loadDrops(circleId) {
+    const { drops } = await api(`/api/circles/${circleId}/drops`);
+    const feedList = $('#feed-list');
+    feedList.innerHTML = '';
+    dropMarkers.forEach((m) => map.removeLayer(m));
+    dropMarkers.clear();
+    if (drops.length === 0) {
+      feedList.innerHTML = `<div class="empty-state"><span class="icon">${ICONS.image}</span>No drops yet. Be the first to leave one.</div>`;
+    }
+    drops.forEach((d) => { addDropToFeed(d, false); addDropMarker(d); });
+  }
+
+  function addDropToFeed(drop, prepend) {
+    const list = $('#feed-list');
+    const emptyState = list.querySelector('.empty-state');
+    if (emptyState) emptyState.remove();
+
+    const item = document.createElement('div');
+    item.className = 'feed-item';
+    const when = new Date(drop.createdAt).toLocaleString();
+    item.innerHTML = `
+      <img src="${drop.imageUrl}" alt="drop" />
+      <div class="info">
+        <div class="author">${escapeHtml(drop.authorName)}${drop.targetUserId ? ' <span class="private-tag">· Private</span>' : ''}</div>
+        <div class="caption">${escapeHtml(drop.caption || '')}</div>
+        <div class="time">${when}</div>
+      </div>`;
+    item.addEventListener('click', () => openImageModal(drop));
+    if (prepend) list.prepend(item); else list.appendChild(item);
+  }
+
+  function addDropMarker(drop) {
+    if (drop.lat == null || drop.lng == null) return;
+    const icon = L.divIcon({
+      className: '',
+      html: `<div class="drop-marker"><span class="icon">${ICONS.camera}</span></div>`,
+      iconSize: [26, 26],
+      iconAnchor: [13, 22],
+    });
+    const marker = L.marker([drop.lat, drop.lng], { icon }).addTo(map);
+    marker.on('click', () => openImageModal(drop));
+    dropMarkers.set(drop.id, marker);
+  }
+
+  function openImageModal(drop) {
+    $('#image-modal-img').src = drop.imageUrl;
+    $('#image-modal-caption').textContent = drop.caption || '';
+    $('#image-modal').classList.remove('hidden');
+  }
+  $('#close-image-btn').addEventListener('click', () => $('#image-modal').classList.add('hidden'));
+
+  $('#drop-btn').addEventListener('click', () => {
+    $('#drop-error').textContent = '';
+    $('#drop-modal').classList.remove('hidden');
+  });
+  $('#cancel-drop-btn').addEventListener('click', () => $('#drop-modal').classList.add('hidden'));
+
+  $('#drop-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    $('#drop-error').textContent = '';
+    const fd = new FormData(e.target);
+    const attachLocation = fd.get('attachLocation') === 'on';
+    if (attachLocation && lastSentPos) {
+      fd.set('lat', lastSentPos.lat);
+      fd.set('lng', lastSentPos.lng);
+    }
+    fd.delete('attachLocation');
+    try {
+      await api(`/api/circles/${currentCircle.id}/drops`, { method: 'POST', body: fd });
+      $('#drop-modal').classList.add('hidden');
+      e.target.reset();
+      toast('Sent');
+      successRipple('accent');
+    } catch (err) {
+      $('#drop-error').textContent = err.message;
+    }
+  });
+
+  // ---------- invite modal ----------
+
+  $('#invite-btn').addEventListener('click', () => {
+    $('#invite-code-text').textContent = currentCircle.code;
+    $('#invite-modal').classList.remove('hidden');
+  });
+  $('#close-invite-btn').addEventListener('click', () => $('#invite-modal').classList.add('hidden'));
+
+  // ---------- feed collapse ----------
+
+  $('#toggle-feed-btn').addEventListener('click', () => {
+    const panel = $('#feed-panel');
+    panel.classList.toggle('collapsed');
+    $('#toggle-feed-btn').textContent = panel.classList.contains('collapsed') ? 'Show' : 'Hide';
+  });
+
+  // ---------- utils ----------
+
+  function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str ?? '';
+    return div.innerHTML;
+  }
+
+  // ---------- boot ----------
+
+  if (token && me) {
+    connectSocket();
+    loadCircles();
+  } else {
+    showScreen('#auth-screen');
+  }
+
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+  }
+})();
